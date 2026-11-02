@@ -339,6 +339,7 @@
         '</div></div>' +
         '<div class="now" id="now"><div><small>Sinal ativo</small><b id="now-name">Selecione um padrão abaixo</b></div><div id="now-viz"></div></div>' +
         '<div class="sounds">' + sounds + '</div>' +
+        '<div class="callout compact mt">' + ic('info') + '<span><b>Observação para iPhone / iOS:</b> O sintetizador utiliza canal de reprodução de mídia. Caso o aparelho esteja com a chave lateral física de modo silencioso ativada, o áudio é reproduzido respeitando o volume principal de mídia do iOS.</span></div>' +
         '</section>' +
 
         '<section class="card train">' +

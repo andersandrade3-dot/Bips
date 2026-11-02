@@ -1,18 +1,121 @@
-/* POST & BEEP LAB - Síntese acústica via Web Audio API e representação de pulsos */
+/* POST & BEEP LAB - Síntese acústica híbrida (Web Audio API + HTML5 Media Audio para iOS) */
 (function () {
   const A = {};
   let ctx = null, master = null, filter = null, compressor = null;
   let volume = 0.9, enabled = true, unlocked = false;
   let timers = [], nodes = [], playToken = 0;
+  let activeBlobUrl = null;
+
+  const isIOS = typeof navigator !== 'undefined' && (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  );
+
+  function setupAudioSession() {
+    if (typeof navigator !== 'undefined' && 'audioSession' in navigator) {
+      try { navigator.audioSession.type = 'playback'; } catch (e) {}
+    }
+  }
+  setupAudioSession();
+
+  let iosPlayer = null;
+  function getIOSPlayer() {
+    if (!iosPlayer && typeof Audio !== 'undefined') {
+      try {
+        iosPlayer = new Audio();
+        iosPlayer.setAttribute('playsinline', '');
+        iosPlayer.setAttribute('webkit-playsinline', '');
+        iosPlayer.preload = 'auto';
+      } catch (e) {}
+    }
+    return iosPlayer;
+  }
+
+  function synthesizeWav(evList, totalDuration, sampleRate) {
+    sampleRate = sampleRate || 22050;
+    const numSamples = Math.ceil(sampleRate * (totalDuration + 0.08));
+    const dataSize = numSamples * 2;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    function writeString(offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    const attack = Math.floor(sampleRate * 0.005);
+    const release = Math.floor(sampleRate * 0.008);
+    const vol = 0.85;
+
+    evList.forEach((e) => {
+      const startIdx = Math.floor(e.t * sampleRate);
+      const endIdx = Math.min(numSamples, Math.floor((e.t + e.d) * sampleRate));
+      const durSamples = endIdx - startIdx;
+      for (let i = 0; i < durSamples; i++) {
+        const idx = startIdx + i;
+        if (idx >= numSamples) break;
+        const t = i / sampleRate;
+        let freq = e.f;
+        if (e.f2) freq = e.f + (e.f2 - e.f) * (i / durSamples);
+
+        const phase = (t * freq) % 1;
+        const wave = phase < 0.5 ? 1 : -1;
+
+        let env = 1;
+        if (i < attack) env = i / attack;
+        else if (i > durSamples - release) env = (durSamples - i) / release;
+
+        const sample = Math.max(-1, Math.min(1, wave * env * vol));
+        view.setInt16(44 + idx * 2, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+      }
+    });
+
+    return buffer;
+  }
+
+  const sfxCache = {};
+  function initSFXCache() {
+    if (typeof Blob === 'undefined' || typeof URL === 'undefined') return;
+    const defs = {
+      click: { ev: [{ t: 0, d: 0.04, f: 640 }], tot: 0.05 },
+      ok: { ev: [{ t: 0, d: 0.09, f: 640 }, { t: 0.09, d: 0.14, f: 860 }], tot: 0.24 },
+      bad: { ev: [{ t: 0, d: 0.14, f: 240 }, { t: 0.13, d: 0.20, f: 180 }], tot: 0.35 },
+      power: { ev: [{ t: 0, d: 0.45, f: 180, f2: 680 }], tot: 0.46 }
+    };
+    for (const [k, v] of Object.entries(defs)) {
+      try {
+        const buf = synthesizeWav(v.ev, v.tot);
+        sfxCache[k] = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+      } catch (e) {}
+    }
+  }
+  initSFXCache();
 
   function ensure() {
+    setupAudioSession();
     if (!ctx) {
-      const AC = window.AudioContext || window.webkitAudioContext;
+      const AC = (typeof window !== 'undefined' ? (window.AudioContext || window.webkitAudioContext) : null);
       if (!AC) return null;
       try {
         ctx = new AC();
+      } catch (e) {
+        return null;
+      }
 
-        // Compressor de dinâmica para maximizar a audibilidade em alto-falantes de smartphones
+      try {
         compressor = ctx.createDynamicsCompressor();
         compressor.threshold.setValueAtTime(-16, ctx.currentTime);
         compressor.knee.setValueAtTime(10, ctx.currentTime);
@@ -31,7 +134,13 @@
         filter.connect(compressor);
         compressor.connect(ctx.destination);
       } catch (e) {
-        return null;
+        try {
+          if (!master) {
+            master = ctx.createGain();
+            master.gain.setValueAtTime(volume, ctx.currentTime);
+          }
+          master.connect(ctx.destination);
+        } catch (err) {}
       }
     }
     if (ctx && ctx.state === 'suspended') {
@@ -40,35 +149,51 @@
     return ctx;
   }
 
-  // Desbloqueio universal do Web Audio API para navegadores móveis (iOS Safari e Android)
   A.unlock = function () {
+    setupAudioSession();
     const c = ensure();
-    if (!c) return;
-    if (c.state === 'suspended') {
+    if (c && c.state === 'suspended') {
       c.resume().catch(() => {});
     }
-    if (!unlocked) {
+
+    const p = getIOSPlayer();
+    if (p && !unlocked) {
+      try {
+        p.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA=';
+        p.volume = 0.01;
+        const prom = p.play();
+        if (prom && prom.then) {
+          prom.then(() => {
+            unlocked = true;
+            p.pause();
+          }).catch(() => {});
+        }
+      } catch (e) {}
+    }
+
+    if (c && !unlocked) {
       try {
         const buf = c.createBuffer(1, 1, 22050);
         const src = c.createBufferSource();
         src.buffer = buf;
         src.connect(c.destination);
         src.start(0);
-        unlocked = true;
+        if (c.state === 'running') unlocked = true;
       } catch (e) {}
     }
   };
 
-  // Registra o desbloqueio no primeiro gesto de interação do usuário
   if (typeof document !== 'undefined') {
-    const triggerUnlock = function () {
+    const unlockHandler = function () {
       A.unlock();
-      ['touchstart', 'touchend', 'pointerdown', 'mousedown', 'keydown'].forEach((evt) => {
-        document.removeEventListener(evt, triggerUnlock, true);
-      });
+      if (unlocked) {
+        ['click', 'touchend', 'touchstart', 'pointerdown', 'pointerup', 'keydown'].forEach((evt) => {
+          document.removeEventListener(evt, unlockHandler, true);
+        });
+      }
     };
-    ['touchstart', 'touchend', 'pointerdown', 'mousedown', 'keydown'].forEach((evt) => {
-      document.addEventListener(evt, triggerUnlock, true);
+    ['click', 'touchend', 'touchstart', 'pointerdown', 'pointerup', 'keydown'].forEach((evt) => {
+      document.addEventListener(evt, unlockHandler, true);
     });
   }
 
@@ -102,7 +227,6 @@
     return { events: ev, total: t };
   };
 
-  /* Notação técnica concisa para leitura assistiva */
   A.describe = function (spec) {
     if (spec === '0') return 'Sem emissão sonora';
     if (spec === 'C') return 'Tom contínuo';
@@ -146,6 +270,7 @@
   A.setVolume = function (v) {
     volume = Math.max(0, Math.min(1, v));
     if (master && ctx) master.gain.setValueAtTime(volume, ctx.currentTime);
+    if (iosPlayer) iosPlayer.volume = volume;
   };
   A.setEnabled = function (b) {
     enabled = !!b;
@@ -158,6 +283,16 @@
     timers.forEach(clearTimeout); timers = [];
     nodes.forEach((n) => { try { n.stop(); } catch (e) { } });
     nodes = [];
+    if (iosPlayer) {
+      try {
+        iosPlayer.pause();
+        iosPlayer.currentTime = 0;
+      } catch (e) {}
+    }
+    if (activeBlobUrl && typeof URL !== 'undefined') {
+      try { URL.revokeObjectURL(activeBlobUrl); } catch (e) {}
+      activeBlobUrl = null;
+    }
     if (typeof document !== 'undefined') {
       document.querySelectorAll('.bviz .b.on').forEach((b) => b.classList.remove('on'));
       document.querySelectorAll('.is-beeping').forEach((e) => e.classList.remove('is-beeping'));
@@ -172,7 +307,6 @@
       o.frequency.setValueAtTime(freq, start);
       if (freq2) o.frequency.linearRampToValueAtTime(freq2, start + dur);
 
-      // Ganho calibrado para excelente audibilidade em celular (padrão 0.65)
       const p = (peak == null ? 0.65 : peak);
       g.gain.setValueAtTime(0.0001, start);
       g.gain.linearRampToValueAtTime(p, start + 0.006);
@@ -199,40 +333,62 @@
     }
     if (!enabled) return total;
 
-    const c = ensure();
+    A.unlock();
+
     const bars = opts.viz ? opts.viz.querySelectorAll('.b') : [];
 
-    const schedule = () => {
-      if (my !== playToken) return;
-      const base = c ? c.currentTime + 0.05 : 0;
-      events.forEach((e, i) => {
-        if (c) tone(e.f, base + e.t, e.d, 'square', 0.65);
-        timers.push(setTimeout(() => {
-          if (my !== playToken) return;
-          if (bars[i]) bars[i].classList.add('on');
-          if (opts.speaker) opts.speaker.classList.add('is-beeping');
-        }, (e.t + 0.05) * 1000));
-        timers.push(setTimeout(() => {
-          if (my !== playToken) return;
-          if (bars[i]) bars[i].classList.remove('on');
-          if (opts.speaker) opts.speaker.classList.remove('is-beeping');
-        }, (e.t + e.d + 0.05) * 1000));
-      });
-
+    events.forEach((e, i) => {
       timers.push(setTimeout(() => {
         if (my !== playToken) return;
-        if (opts.onEnd) opts.onEnd();
-      }, (total + 0.1) * 1000));
-    };
+        if (bars[i]) bars[i].classList.add('on');
+        if (opts.speaker) opts.speaker.classList.add('is-beeping');
+      }, (e.t + 0.05) * 1000));
+      timers.push(setTimeout(() => {
+        if (my !== playToken) return;
+        if (bars[i]) bars[i].classList.remove('on');
+        if (opts.speaker) opts.speaker.classList.remove('is-beeping');
+      }, (e.t + e.d + 0.05) * 1000));
+    });
 
-    if (c && c.state === 'suspended') {
-      c.resume().then(() => {
-        if (my === playToken) schedule();
-      }).catch(() => {
-        if (my === playToken) schedule();
-      });
+    timers.push(setTimeout(() => {
+      if (my !== playToken) return;
+      if (opts.onEnd) opts.onEnd();
+    }, (total + 0.1) * 1000));
+
+    if (isIOS && typeof Blob !== 'undefined' && typeof URL !== 'undefined') {
+      try {
+        const wavBuffer = synthesizeWav(events, total);
+        const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+        activeBlobUrl = URL.createObjectURL(blob);
+        const p = getIOSPlayer();
+        if (p) {
+          p.pause();
+          p.volume = volume;
+          p.src = activeBlobUrl;
+          p.currentTime = 0;
+          const prom = p.play();
+          if (prom && prom.catch) prom.catch(() => {});
+        }
+      } catch (e) {}
     } else {
-      schedule();
+      const c = ensure();
+      const schedule = () => {
+        if (my !== playToken) return;
+        const base = c ? c.currentTime + 0.05 : 0;
+        events.forEach((e) => {
+          if (c) tone(e.f, base + e.t, e.d, 'square', 0.65);
+        });
+      };
+
+      if (c && c.state === 'suspended') {
+        c.resume().then(() => {
+          if (my === playToken) schedule();
+        }).catch(() => {
+          if (my === playToken) schedule();
+        });
+      } else {
+        schedule();
+      }
     }
 
     return total;
@@ -240,25 +396,43 @@
 
   A.sfx = function (kind) {
     if (!enabled) return;
-    const c = ensure(); if (!c) return;
+    A.unlock();
 
-    const playSeq = () => {
-      const t = c.currentTime + 0.01;
-      const seq = {
-        click: [[640, 0, 0.04]],
-        ok: [[640, 0, 0.09], [860, 0.09, 0.14]],
-        bad: [[240, 0, 0.14], [180, 0.13, 0.20]],
-        power: [[180, 0, 0.45, 680]]
-      }[kind] || [];
-      seq.forEach((s) => tone(s[0], t + s[1], s[2], 'triangle', 0.45, s[3]));
-    };
-
-    if (c.state === 'suspended') {
-      c.resume().then(playSeq).catch(() => {});
+    if (isIOS && sfxCache[kind]) {
+      const p = getIOSPlayer();
+      if (p) {
+        try {
+          p.pause();
+          p.volume = volume;
+          p.src = sfxCache[kind];
+          p.currentTime = 0;
+          const prom = p.play();
+          if (prom && prom.catch) prom.catch(() => {});
+        } catch (e) {}
+      }
     } else {
-      playSeq();
+      const c = ensure(); if (!c) return;
+      const playSeq = () => {
+        const t = c.currentTime + 0.01;
+        const seq = {
+          click: [[640, 0, 0.04]],
+          ok: [[640, 0, 0.09], [860, 0.09, 0.14]],
+          bad: [[240, 0, 0.14], [180, 0.13, 0.20]],
+          power: [[180, 0, 0.45, 680]]
+        }[kind] || [];
+        seq.forEach((s) => tone(s[0], t + s[1], s[2], 'triangle', 0.45, s[3]));
+      };
+
+      if (c.state === 'suspended') {
+        c.resume().then(playSeq).catch(() => {});
+      } else {
+        playSeq();
+      }
     }
   };
 
-  PBL.audio = A;
+  if (typeof window !== 'undefined') {
+    if (!window.PBL) window.PBL = {};
+    window.PBL.audio = A;
+  }
 })();
