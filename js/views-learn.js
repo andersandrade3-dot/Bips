@@ -66,6 +66,7 @@
 
       $('#btn-start').addEventListener('click', () => {
         U.clearTimers();
+        A.unlock();
         A.play('S');
         root.classList.add('leaving');
         setTimeout(() => {

@@ -92,6 +92,7 @@
   };
 
   function setSound(on) {
+    if (on) A.unlock();
     S.setPref('sound', on);
     A.setEnabled(on);
     if (on) A.sfx('ok');

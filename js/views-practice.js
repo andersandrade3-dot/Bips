@@ -124,6 +124,7 @@
 
       function power() {
         if (state !== 'off') return;
+        A.unlock();
         state = 'post'; cur = next(); ticket++;
         pc.classList.add('on');
         if (monLed) monLed.classList.add('on');
